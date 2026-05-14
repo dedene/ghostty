@@ -110,6 +110,10 @@ pub const RenderState = struct {
     /// values for comparison.
     viewport_pin: ?PageList.Pin = null,
 
+    /// Visual-only fractional scroll state used by renderers. This never
+    /// changes the terminal viewport, copy/search semantics, or scrollback.
+    smooth_scroll: SmoothScroll = .{},
+
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
@@ -147,6 +151,25 @@ pub const RenderState = struct {
         .row_data = .empty,
         .dirty = .false,
         .screen = .primary,
+        .smooth_scroll = .{},
+    };
+
+    pub const SmoothScroll = struct {
+        offset_y: f32 = 0,
+        before: size.CellCountInt = 0,
+        after: size.CellCountInt = 0,
+
+        pub fn active(self: SmoothScroll) bool {
+            return self.offset_y != 0;
+        }
+
+        pub fn guarded(self: SmoothScroll) bool {
+            return self.before != 0 or self.after != 0;
+        }
+    };
+
+    pub const UpdateOptions = struct {
+        smooth_scroll: SmoothScroll = .{},
     };
 
     /// The color state for the terminal.
@@ -218,6 +241,9 @@ pub const RenderState = struct {
         /// consumers validate the pin without dereferencing its node after
         /// the terminal lock has been released.
         serial: u64,
+
+        /// True if this row is a synthetic guard slot with no backing page row.
+        blank: bool,
 
         /// Raw row data.
         raw: page.Row,
@@ -349,6 +375,16 @@ pub const RenderState = struct {
         self.endUpdate();
     }
 
+    pub fn updateWithOptions(
+        self: *RenderState,
+        alloc: Allocator,
+        t: *Terminal,
+        opts: UpdateOptions,
+    ) Allocator.Error!void {
+        try self.beginUpdateWithOptions(alloc, t, opts);
+        self.endUpdate();
+    }
+
     /// Begin an update of the render state to the latest terminal
     /// state. Every begin must be completed with an `endUpdate` call
     /// before the render state is read.
@@ -375,8 +411,30 @@ pub const RenderState = struct {
         alloc: Allocator,
         t: *Terminal,
     ) Allocator.Error!void {
+        return self.beginUpdateWithOptions(alloc, t, .{});
+    }
+
+    pub fn beginUpdateWithOptions(
+        self: *RenderState,
+        alloc: Allocator,
+        t: *Terminal,
+        opts: UpdateOptions,
+    ) Allocator.Error!void {
         const s: *Screen = t.screens.active;
         const viewport_pin = s.pages.getTopLeft(.viewport);
+        const smooth_scroll: SmoothScroll = smooth_scroll: {
+            if (opts.smooth_scroll.offset_y == 0 and
+                opts.smooth_scroll.before == 0 and
+                opts.smooth_scroll.after == 0) break :smooth_scroll .{};
+
+            break :smooth_scroll .{
+                .offset_y = opts.smooth_scroll.offset_y,
+                .before = if (opts.smooth_scroll.before == 0) 1 else opts.smooth_scroll.before,
+                .after = if (opts.smooth_scroll.after == 0) 1 else opts.smooth_scroll.after,
+            };
+        };
+        const rows: size.CellCountInt =
+            s.pages.rows + smooth_scroll.before + smooth_scroll.after;
         const redraw = redraw: {
             // If our screen key changed, we need to do a full rebuild
             // because our render state is viewport-specific.
@@ -399,8 +457,15 @@ pub const RenderState = struct {
             }
 
             // If our dimensions changed, we do a full rebuild.
-            if (self.rows != s.pages.rows or
+            if (self.rows != rows or
                 self.cols != s.pages.cols)
+            {
+                break :redraw true;
+            }
+
+            // If the guard row shape changed, the visual row set changed.
+            if (self.smooth_scroll.before != smooth_scroll.before or
+                self.smooth_scroll.after != smooth_scroll.after)
             {
                 break :redraw true;
             }
@@ -414,9 +479,10 @@ pub const RenderState = struct {
         };
 
         // Always set our cheap fields, its more expensive to compare
-        self.rows = s.pages.rows;
+        self.rows = rows;
         self.cols = s.pages.cols;
         self.viewport_pin = viewport_pin;
+        self.smooth_scroll = smooth_scroll;
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };
         self.cursor.cell = s.cursor.page_cell.*;
         self.cursor.style = s.cursor.style;
@@ -476,6 +542,7 @@ pub const RenderState = struct {
                         .arena = .{},
                         .pin = undefined,
                         .serial = undefined,
+                        .blank = true,
                         .raw = undefined,
                         .cells = .empty,
                         .dirty = true,
@@ -505,6 +572,7 @@ pub const RenderState = struct {
         const row_arenas = row_data.items(.arena);
         const row_pins = row_data.items(.pin);
         const row_serials = row_data.items(.serial);
+        const row_blanks = row_data.items(.blank);
         const row_rows = row_data.items(.raw);
         const row_cells = row_data.items(.cells);
         const row_sels = row_data.items(.selection);
@@ -535,122 +603,225 @@ pub const RenderState = struct {
             .pending_styles = &self.pending_styles,
             .applied_styles = row_applied,
         };
-        var y: usize = 0;
         var any_dirty: bool = false;
-        var page_it = viewport_pin.pageIterator(.right_down, null);
-        while (y < self.rows) {
-            const chunk = page_it.next() orelse break;
-            const node = chunk.node;
-            const node_serial = node.serial;
-            const p: *page.Page = node.page();
+        if (smooth_scroll.guarded()) {
+            // Smooth scrolling adds guard rows above and below the viewport.
+            // This uncommon path walks individual rows; the normal viewport
+            // retains the chunked fast path below.
+            const bottom_pin = s.pages.getBottomRight(.viewport) orelse viewport_pin;
+            var after_guard_pin: ?PageList.Pin = pin: {
+                var pin = bottom_pin.down(1) orelse break :pin null;
+                pin.x = 0;
+                break :pin pin;
+            };
+            var row_it = viewport_pin.rowIterator(.right_down, null);
+            var dirty_page: ?*page.Page = null;
 
-            // The number of rows we consume from this chunk. The chunk
-            // may extend beyond the viewport (the viewport is always
-            // exactly `rows` tall) so we clamp.
-            const take: usize = @min(
-                @as(usize, chunk.end - chunk.start),
-                self.rows - y,
-            );
+            for (0..self.rows) |y| {
+                const row_pin: ?PageList.Pin = pin: {
+                    if (y < smooth_scroll.before) {
+                        var before_pin = viewport_pin.up(smooth_scroll.before - y) orelse
+                            break :pin null;
+                        before_pin.x = 0;
+                        break :pin before_pin;
+                    }
+                    if (y < smooth_scroll.before + s.pages.rows)
+                        break :pin row_it.next();
 
-            // Find our cursor if we haven't found it yet. We do this even
-            // if rows are not dirty because the cursor is unrelated. We
-            // can check the chunk bounds once rather than every row.
-            if (self.cursor.viewport == null and
-                node == s.cursor.page_pin.node)
-            cursor: {
-                const cy = s.cursor.page_pin.y;
-                if (cy < chunk.start or cy >= chunk.start + take) break :cursor;
-                self.cursor.viewport = .{
-                    .y = @intCast(y + (cy - chunk.start)),
-                    .x = s.cursor.x,
-
-                    // Future: we should use our own state here to look this
-                    // up rather than calling this.
-                    .wide_tail = if (s.cursor.x > 0)
-                        s.cursorCellLeft(1).wide == .wide
-                    else
-                        false,
+                    const result = after_guard_pin;
+                    after_guard_pin = if (after_guard_pin) |p| next: {
+                        var next_pin = p.down(1) orelse break :next null;
+                        next_pin.x = 0;
+                        break :next next_pin;
+                    } else null;
+                    break :pin result;
                 };
-            }
 
-            // The page-level dirty flag applies to every row in the chunk.
-            // We consume (clear) it now; each node appears at most once in
-            // this iteration and we're the only consumer of dirty state.
-            const page_dirty = p.dirty;
-            if (page_dirty) p.dirty = false;
-
-            // Get our contiguous rows for this chunk.
-            const page_rows: []page.Row = p.rows.ptr(p.memory)[chunk.start..][0..take];
-            assert(p.size.cols == self.cols);
-
-            // Store our pins and their node generations. We have to store
-            // these even for rows that aren't dirty because dirty is only a
-            // renderer optimization; it doesn't apply to memory movement.
-            // This lets us remap any cell pins back to an exact entry in our
-            // RenderState and validate them later without dereferencing a
-            // potentially stale node.
-            //
-            // We can skip the writes when the pins and serials are unchanged:
-            // if we're not redrawing, every value was stored by a prior update
-            // (row count changes force a redraw). Within a single update a
-            // node appears at most once and its stored pins have consecutive
-            // y values, so if the first and last entries of this chunk's range
-            // already match then every entry in between matches too.
-            if (redraw or
-                row_pins[y].node != node or
-                row_pins[y].y != chunk.start or
-                row_serials[y] != node_serial or
-                row_pins[y + take - 1].node != node or
-                row_pins[y + take - 1].y != chunk.start + take - 1 or
-                row_serials[y + take - 1] != node_serial)
-            {
-                for (
-                    row_pins[y..][0..take],
-                    row_serials[y..][0..take],
-                    chunk.start..,
-                ) |*pin, *serial, py| {
-                    pin.* = .{ .node = node, .y = @intCast(py) };
-                    serial.* = node_serial;
-                }
-            }
-
-            if (!redraw and !page_dirty) {
-                // Only dirty rows (usually none) need a rebuild. Scan the
-                // dirty flags a group at a time; the dirty bit is directly
-                // testable on the packed row representation.
-                var i: usize = 0;
-                while (take - i >= RowDirtyMask.group_len) : (i += RowDirtyMask.group_len) {
-                    if (RowDirtyMask.match(page_rows, i)) {
-                        @branchHint(.likely);
-                        continue;
+                if (row_pin == null) {
+                    // Keep a synthetic slot at scrollback boundaries so the
+                    // visual origin remains stable.
+                    if (!row_blanks[y] or
+                        row_cells[y].len > 0 or
+                        row_sels[y] != null or
+                        row_highlights[y].items.len > 0)
+                    {
+                        var arena = row_arenas[y].promote(alloc);
+                        defer row_arenas[y] = arena.state;
+                        _ = arena.reset(.retain_capacity);
+                        row_cells[y].clearRetainingCapacity();
+                        row_sels[y] = null;
+                        row_highlights[y] = .empty;
+                        row_applied[y].clearRetainingCapacity();
+                        row_dirties[y] = true;
+                        any_dirty = true;
                     }
 
-                    for (page_rows[i..][0..RowDirtyMask.group_len], i..) |*page_row, j| {
+                    row_blanks[y] = true;
+                    row_rows[y] = .{ .cells = .{} };
+                    continue;
+                }
+
+                const pin = row_pin.?;
+                const node = pin.node;
+                const node_serial = node.serial;
+                const p: *page.Page = node.page();
+                const page_row = pin.rowAndCell().row;
+
+                if (self.cursor.viewport == null and
+                    node == s.cursor.page_pin.node and
+                    pin.y == s.cursor.page_pin.y)
+                {
+                    self.cursor.viewport = .{
+                        .y = @intCast(y),
+                        .x = s.cursor.x,
+                        .wide_tail = if (s.cursor.x > 0)
+                            s.cursorCellLeft(1).wide == .wide
+                        else
+                            false,
+                    };
+                }
+
+                const was_blank = row_blanks[y];
+                const pin_changed = !was_blank and
+                    (!row_pins[y].eql(pin) or row_serials[y] != node_serial);
+                row_pins[y] = pin;
+                row_serials[y] = node_serial;
+                row_blanks[y] = false;
+
+                // A page dirty flag applies to all of its contiguous rows.
+                if (dirty_page != p) {
+                    dirty_page = if (p.dirty) p else null;
+                    if (p.dirty) p.dirty = false;
+                }
+                const dirty = redraw or was_blank or pin_changed or
+                    dirty_page == p or page_row.dirty;
+                if (!dirty) continue;
+
+                page_row.dirty = false;
+                any_dirty = true;
+                try builder.row(p, page_row, y);
+            }
+        } else {
+            var y: usize = 0;
+            var page_it = viewport_pin.pageIterator(.right_down, null);
+            while (y < self.rows) {
+                const chunk = page_it.next() orelse break;
+                const node = chunk.node;
+                const node_serial = node.serial;
+                const p: *page.Page = node.page();
+
+                // The number of rows we consume from this chunk. The chunk
+                // may extend beyond the viewport (the viewport is always
+                // exactly `rows` tall) so we clamp.
+                const take: usize = @min(
+                    @as(usize, chunk.end - chunk.start),
+                    self.rows - y,
+                );
+
+                // Find our cursor if we haven't found it yet. We do this even
+                // if rows are not dirty because the cursor is unrelated. We
+                // can check the chunk bounds once rather than every row.
+                if (self.cursor.viewport == null and
+                    node == s.cursor.page_pin.node)
+                cursor: {
+                    const cy = s.cursor.page_pin.y;
+                    if (cy < chunk.start or cy >= chunk.start + take) break :cursor;
+                    self.cursor.viewport = .{
+                        .y = @intCast(y + (cy - chunk.start)),
+                        .x = s.cursor.x,
+
+                        // Future: we should use our own state here to look this
+                        // up rather than calling this.
+                        .wide_tail = if (s.cursor.x > 0)
+                            s.cursorCellLeft(1).wide == .wide
+                        else
+                            false,
+                    };
+                }
+
+                // The page-level dirty flag applies to every row in the chunk.
+                // We consume (clear) it now; each node appears at most once in
+                // this iteration and we're the only consumer of dirty state.
+                const page_dirty = p.dirty;
+                if (page_dirty) p.dirty = false;
+
+                // Get our contiguous rows for this chunk.
+                const page_rows: []page.Row = p.rows.ptr(p.memory)[chunk.start..][0..take];
+                assert(p.size.cols == self.cols);
+
+                // Store our pins and their node generations. We have to store
+                // these even for rows that aren't dirty because dirty is only a
+                // renderer optimization; it doesn't apply to memory movement.
+                // This lets us remap any cell pins back to an exact entry in our
+                // RenderState and validate them later without dereferencing a
+                // potentially stale node.
+                //
+                // We can skip the writes when the pins and serials are unchanged:
+                // if we're not redrawing, every value was stored by a prior update
+                // (row count changes force a redraw). Within a single update a
+                // node appears at most once and its stored pins have consecutive
+                // y values, so if the first and last entries of this chunk's range
+                // already match then every entry in between matches too.
+                if (redraw or
+                    row_pins[y].node != node or
+                    row_pins[y].y != chunk.start or
+                    row_serials[y] != node_serial or
+                    row_pins[y + take - 1].node != node or
+                    row_pins[y + take - 1].y != chunk.start + take - 1 or
+                    row_serials[y + take - 1] != node_serial)
+                {
+                    for (
+                        row_pins[y..][0..take],
+                        row_serials[y..][0..take],
+                        row_blanks[y..][0..take],
+                        chunk.start..,
+                    ) |*pin, *serial, *blank, py| {
+                        pin.* = .{ .node = node, .y = @intCast(py) };
+                        serial.* = node_serial;
+                        blank.* = false;
+                    }
+                } else {
+                    @memset(row_blanks[y..][0..take], false);
+                }
+
+                if (!redraw and !page_dirty) {
+                    // Only dirty rows (usually none) need a rebuild. Scan the
+                    // dirty flags a group at a time; the dirty bit is directly
+                    // testable on the packed row representation.
+                    var i: usize = 0;
+                    while (take - i >= RowDirtyMask.group_len) : (i += RowDirtyMask.group_len) {
+                        if (RowDirtyMask.match(page_rows, i)) {
+                            @branchHint(.likely);
+                            continue;
+                        }
+
+                        for (page_rows[i..][0..RowDirtyMask.group_len], i..) |*page_row, j| {
+                            if (!page_row.dirty) continue;
+                            page_row.dirty = false;
+                            any_dirty = true;
+                            try builder.row(p, page_row, y + j);
+                        }
+                    }
+                    while (i < take) : (i += 1) {
+                        const page_row = &page_rows[i];
                         if (!page_row.dirty) continue;
                         page_row.dirty = false;
                         any_dirty = true;
-                        try builder.row(p, page_row, y + j);
+                        try builder.row(p, page_row, y + i);
+                    }
+                } else {
+                    // Rebuild every row in the chunk.
+                    any_dirty = true;
+                    for (page_rows, 0..) |*page_row, i| {
+                        page_row.dirty = false;
+                        try builder.row(p, page_row, y + i);
                     }
                 }
-                while (i < take) : (i += 1) {
-                    const page_row = &page_rows[i];
-                    if (!page_row.dirty) continue;
-                    page_row.dirty = false;
-                    any_dirty = true;
-                    try builder.row(p, page_row, y + i);
-                }
-            } else {
-                // Rebuild every row in the chunk.
-                any_dirty = true;
-                for (page_rows, 0..) |*page_row, i| {
-                    page_row.dirty = false;
-                    try builder.row(p, page_row, y + i);
-                }
-            }
 
-            y += take;
+                y += take;
+            }
+            assert(y == self.rows);
         }
-        assert(y == self.rows);
 
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely
@@ -706,8 +877,11 @@ pub const RenderState = struct {
             // matching selection pages.
             for (
                 row_pins,
+                row_blanks,
                 row_sels,
-            ) |pin, *sel_bounds| {
+            ) |pin, row_blank, *sel_bounds| {
+                if (row_blank) continue;
+
                 const p = s.pages.pointFromPin(.screen, pin).?.screen;
                 const row_sel = sel.containedRowCached(
                     s,
@@ -895,14 +1069,18 @@ pub const RenderState = struct {
         const row_dirties = row_data.items(.dirty);
         const row_pins = row_data.items(.pin);
         const row_serials = row_data.items(.serial);
+        const row_blanks = row_data.items(.blank);
         const row_highlights_slice = row_data.items(.highlights);
         for (
             row_arenas,
             row_pins,
             row_serials,
+            row_blanks,
             row_highlights_slice,
             row_dirties,
-        ) |*row_arena, row_pin, row_serial, *row_highlights, *dirty| {
+        ) |*row_arena, row_pin, row_serial, row_blank, *row_highlights, *dirty| {
+            if (row_blank) continue;
+
             for (hls) |hl| {
                 const chunks_slice = hl.chunks.slice();
                 const nodes = chunks_slice.items(.node);
@@ -975,13 +1153,19 @@ pub const RenderState = struct {
     ) (Allocator.Error || std.Io.Writer.Error)!void {
         const row_slice = self.row_data.slice();
         const row_rows = row_slice.items(.raw);
+        const row_blanks = row_slice.items(.blank);
         const row_cells = row_slice.items(.cells);
 
         for (
             0..,
             row_rows,
+            row_blanks,
             row_cells,
-        ) |y, row, cells| {
+        ) |y, row, row_blank, cells| {
+            if (row_blank or
+                y < self.smooth_scroll.before or
+                y >= row_rows.len - self.smooth_scroll.after) continue;
+
             const cells_slice = cells.slice();
             for (
                 0..,
@@ -1001,7 +1185,7 @@ pub const RenderState = struct {
 
                 if (map) |m| try m.map.appendNTimes(m.alloc, .{
                     .x = @intCast(x),
-                    .y = @intCast(y),
+                    .y = @intCast(y - self.smooth_scroll.before),
                 }, len);
             }
 
@@ -1009,7 +1193,7 @@ pub const RenderState = struct {
                 try writer.writeAll("\n");
                 if (map) |m| try m.map.append(m.alloc, .{
                     .x = @intCast(cells_slice.len),
-                    .y = @intCast(y),
+                    .y = @intCast(y - self.smooth_scroll.before),
                 });
             }
         }
@@ -1037,16 +1221,19 @@ pub const RenderState = struct {
 
         const row_slice = self.row_data.slice();
         const row_pins = row_slice.items(.pin);
+        const row_blanks = row_slice.items(.blank);
         const row_cells = row_slice.items(.cells);
 
         // Our viewport point is sent in by the caller and can't be trusted.
         // If it is outside the valid area then just return empty because
         // we can't possibly have a link there.
+        const row_idx = viewport_point.y + self.smooth_scroll.before;
         if (viewport_point.x >= self.cols or
-            viewport_point.y >= row_pins.len) return result;
+            row_idx >= row_pins.len or
+            row_blanks[row_idx]) return result;
 
         // Grab our link ID
-        const link_pin: PageList.Pin = row_pins[viewport_point.y];
+        const link_pin: PageList.Pin = row_pins[row_idx];
         const link_page: *page.Page = link_pin.node.page();
         const link = link: {
             const rac = link_page.getRowAndCell(
@@ -1071,8 +1258,13 @@ pub const RenderState = struct {
         for (
             0..,
             row_pins,
+            row_blanks,
             row_cells,
-        ) |y, pin, cells| {
+        ) |y, pin, row_blank, cells| {
+            if (row_blank) continue;
+            if (y < self.smooth_scroll.before or
+                y >= row_pins.len - self.smooth_scroll.after) continue;
+
             for (0.., cells.items(.raw)) |x, cell| {
                 if (!cell.hyperlink) continue;
 
@@ -1091,7 +1283,7 @@ pub const RenderState = struct {
                     other,
                     other_page.memory,
                 )) try result.put(alloc, .{
-                    .y = @intCast(y),
+                    .y = @intCast(y - self.smooth_scroll.before),
                     .x = @intCast(x),
                 }, {});
             }
@@ -1361,6 +1553,85 @@ test "styled" {
     var state: RenderState = .empty;
     defer state.deinit(alloc);
     try state.update(alloc, &t);
+}
+
+test "smooth scroll update includes extra rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 5,
+        .rows = 3,
+        .max_scrollback = 1000,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("1\r\n2\r\n3\r\n4\r\n5");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+
+    try state.updateWithOptions(alloc, &t, .{
+        .smooth_scroll = .{ .offset_y = 4, .before = 2, .after = 2 },
+    });
+    try testing.expectEqual(@as(size.CellCountInt, 7), state.rows);
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.smooth_scroll.before);
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.smooth_scroll.after);
+
+    t.scrollViewport(.{ .delta = -1 });
+    try state.updateWithOptions(alloc, &t, .{
+        .smooth_scroll = .{ .offset_y = -4, .before = 2, .after = 2 },
+    });
+    try testing.expectEqual(@as(size.CellCountInt, 7), state.rows);
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.smooth_scroll.before);
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.smooth_scroll.after);
+
+    try state.updateWithOptions(alloc, &t, .{
+        .smooth_scroll = .{ .offset_y = -4, .before = 2, .after = 2 },
+    });
+    try testing.expectEqual(@as(size.CellCountInt, 7), state.rows);
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.smooth_scroll.before);
+    try testing.expectEqual(@as(size.CellCountInt, 2), state.smooth_scroll.after);
+    try testing.expectEqual(@as(u21, '1'), state.row_data.items(.cells)[1].get(0).raw.codepoint());
+    try testing.expectEqual(@as(u21, '5'), state.row_data.items(.cells)[5].get(0).raw.codepoint());
+    try testing.expectEqual(@as(size.CellCountInt, 0), state.row_data.items(.pin)[1].x);
+    try testing.expectEqual(@as(size.CellCountInt, 0), state.row_data.items(.pin)[5].x);
+
+    t.scrollViewport(.{ .delta = 1 });
+    try state.updateWithOptions(alloc, &t, .{
+        .smooth_scroll = .{ .offset_y = -4, .before = 2, .after = 2 },
+    });
+    try testing.expectEqual(@as(u21, '1'), state.row_data.items(.cells)[0].get(0).raw.codepoint());
+    try testing.expectEqual(@as(u21, '2'), state.row_data.items(.cells)[1].get(0).raw.codepoint());
+    try testing.expectEqual(@as(u21, '3'), state.row_data.items(.cells)[2].get(0).raw.codepoint());
+
+    t.scrollViewport(.top);
+    t.scrollViewport(.{ .delta = 1 });
+    try state.updateWithOptions(alloc, &t, .{
+        .smooth_scroll = .{ .offset_y = -4, .before = 2, .after = 2 },
+    });
+    try testing.expectEqual(@as(size.CellCountInt, 7), state.rows);
+    try testing.expect(!state.row_data.items(.blank)[state.rows - 2]);
+    try testing.expectEqual(@as(size.CellCountInt, 0), state.row_data.items(.pin)[state.rows - 2].x);
+    try testing.expect(state.row_data.items(.cells)[state.rows - 2].len > 0);
+
+    const top = t.screens.active.pages.getTopLeft(.viewport);
+    var before = top.up(1).?;
+    const bottom = t.screens.active.pages.getBottomRight(.viewport).?;
+    var after = bottom.down(1).?;
+    before.x = 0;
+    after.x = t.cols - 1;
+    try t.screens.active.select(Selection.init(before, after, false));
+
+    try state.updateWithOptions(alloc, &t, .{
+        .smooth_scroll = .{ .offset_y = 4, .before = 2, .after = 2 },
+    });
+    const row_sels = state.row_data.items(.selection);
+    try testing.expect(row_sels[1] != null);
+    try testing.expect(row_sels[row_sels.len - 2] != null);
 }
 
 test "basic text" {
