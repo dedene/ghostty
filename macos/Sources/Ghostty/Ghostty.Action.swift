@@ -109,7 +109,7 @@ extension Ghostty.Action {
 
     struct Scrollbar {
         let total: UInt64
-        let offset: UInt64
+        let offset: Double
         let len: UInt64
 
         init(c: ghostty_action_scrollbar_s) {
