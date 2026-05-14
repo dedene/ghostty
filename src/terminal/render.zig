@@ -289,6 +289,25 @@ pub const RenderState = struct {
         }
     };
 
+    /// Visual-only fractional scroll state for renderers that draw the
+    /// viewport shifted by part of a row. It never changes the terminal
+    /// viewport, copy/search semantics, or scrollback. `before` and `after`
+    /// are the overscan rows the renderer wants while the offset is active;
+    /// it requests them through `overscan_request`.
+    pub const SmoothScroll = struct {
+        offset_y: f32 = 0,
+        before: size.CellCountInt = 0,
+        after: size.CellCountInt = 0,
+
+        pub fn active(self: SmoothScroll) bool {
+            return self.offset_y != 0;
+        }
+
+        pub fn guarded(self: SmoothScroll) bool {
+            return self.before != 0 or self.after != 0;
+        }
+    };
+
     /// A captured row. This is either a viewport row or an overscan row,
     /// depending on its index in `row_data`.
     pub const Row = struct {

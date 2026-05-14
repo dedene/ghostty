@@ -748,6 +748,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cell_size = undefined,
                     .grid_size = undefined,
                     .grid_padding = undefined,
+                    .smooth_scroll_offset = .{ 0, 0 },
+                    .image_scroll_offset = .{ 0, 0 },
                     .screen_size = undefined,
                     .padding_extend = .{},
                     .min_contrast = options.config.min_contrast,
@@ -1372,6 +1374,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 links: terminal.RenderState.CellSet,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
+                smooth_scroll: terminal.RenderState.SmoothScroll,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
             };
@@ -1415,6 +1418,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     // Scroll
                     state.terminal.scrollViewport(.bottom);
+                    state.smooth_scroll = .{};
                 }
 
                 // Begin the update of our terminal state. Work that
@@ -1422,9 +1426,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // denormalization) is deferred to the endUpdate call
                 // outside of this critical section, keeping our lock
                 // hold time as short as possible.
-                try self.terminal_state.beginUpdate(
+                try self.terminal_state.beginUpdateWithOptions(
                     self.alloc,
                     state.terminal,
+                    .{
+                        .smooth_scroll = .{
+                            .offset_y = state.smooth_scroll.offset_y,
+                            .before = 2,
+                            .after = 2,
+                        },
+                    },
                 );
 
                 // If our terminal state is dirty at all we need to redo
@@ -1438,7 +1449,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // naturally limits the number of calls to this method (it
                 // can be expensive) and also makes it so we don't need another
                 // cross-thread mailbox message within the IO path.
-                const scrollbar = state.terminal.screens.active.pages.scrollbar();
+                var scrollbar = state.terminal.screens.active.pages.scrollbar();
+                if (self.terminal_state.smooth_scroll.active()) scrollbar: {
+                    const cell_height: f64 = @floatFromInt(self.size.cell.height);
+                    if (cell_height <= 0) break :scrollbar;
+
+                    const offset_fraction =
+                        -@as(f64, self.terminal_state.smooth_scroll.offset_y) / cell_height;
+                    const int_offset: f64 = @floatFromInt(scrollbar.offset);
+                    const max_offset: f64 = if (scrollbar.total > scrollbar.len)
+                        @floatFromInt(scrollbar.total - scrollbar.len)
+                    else
+                        0;
+                    const visual_offset = @min(
+                        @max(int_offset + offset_fraction, 0),
+                        max_offset,
+                    );
+                    scrollbar.offset_fraction = visual_offset - int_offset;
+                }
 
                 // Get our preedit state
                 const preedit: ?renderer.State.Preedit = preedit: {
@@ -1526,6 +1554,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .links = links,
                     .mouse = state.mouse,
                     .preedit = preedit,
+                    .smooth_scroll = self.terminal_state.smooth_scroll,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
                 };
@@ -1618,6 +1647,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 defer self.draw_mutex.unlock(global.io());
 
                 // Build our GPU cells
+                const old_smooth_scroll_offset = self.uniforms.smooth_scroll_offset;
+                const prepended_guard_height =
+                    @as(f32, @floatFromInt(self.size.cell.height)) *
+                    @as(f32, @floatFromInt(critical.smooth_scroll.before));
+                const smooth_scroll_offset_y: f32 =
+                    critical.smooth_scroll.offset_y - prepended_guard_height;
+                self.uniforms.smooth_scroll_offset = .{
+                    0,
+                    smooth_scroll_offset_y,
+                };
+                self.uniforms.image_scroll_offset = .{
+                    0,
+                    critical.smooth_scroll.offset_y,
+                };
+                if (old_smooth_scroll_offset[0] != self.uniforms.smooth_scroll_offset[0] or
+                    old_smooth_scroll_offset[1] != self.uniforms.smooth_scroll_offset[1])
+                {
+                    self.cells_rebuilt = true;
+                }
+
                 self.rebuildCells(
                     critical.preedit,
                     renderer.cursorStyle(&self.terminal_state, .{
@@ -2242,10 +2291,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Blank space around the grid.
             const blank: renderer.Padding = self.size.screen.blankPadding(
                 self.size.padding,
-                .{
-                    .columns = self.cells.size.columns,
-                    .rows = self.cells.size.rows,
-                },
+                self.size.grid(),
                 .{
                     .width = self.grid_metrics.cell_width,
                     .height = self.grid_metrics.cell_height,
@@ -2451,6 +2497,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 var pixel_y: f32 = @floatFromInt(
                     cursor.grid_pos[1] * cell.height + padding.top,
                 );
+                pixel_y += self.uniforms.smooth_scroll_offset[1];
 
                 // If +Y is up in our shaders, we need to flip the coordinate
                 // so that it's instead the top edge of the cell relative to
@@ -2919,7 +2966,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .background, .@"extend-always" => {},
 
                 // Apply heuristics for padding extension.
-                .extend => if (y == 0) {
+                .extend => if (y == state.smooth_scroll.before) {
                     self.uniforms.padding_extend.up = !rowNeverExtendBg(
                         row,
                         cells_raw,
@@ -2927,7 +2974,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         &state.colors.palette,
                         state.colors.background,
                     );
-                } else if (y == self.cells.size.rows - 1) {
+                } else if (y + state.smooth_scroll.after + 1 == self.cells.size.rows) {
                     self.uniforms.padding_extend.down = !rowNeverExtendBg(
                         row,
                         cells_raw,
