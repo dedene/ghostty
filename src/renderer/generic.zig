@@ -45,6 +45,34 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
+fn smoothScrollRenderOptions(
+    smooth_scroll: terminal.RenderState.SmoothScroll,
+) terminal.RenderState.SmoothScroll {
+    return if (smooth_scroll.offset_y != 0)
+        .{
+            .offset_y = smooth_scroll.offset_y,
+            .before = 2,
+            .after = 2,
+        }
+    else
+        .{};
+}
+
+test "smooth scroll render options only guard active visual offsets" {
+    try std.testing.expectEqual(
+        terminal.RenderState.SmoothScroll{},
+        smoothScrollRenderOptions(.{}),
+    );
+    try std.testing.expectEqual(
+        terminal.RenderState.SmoothScroll{},
+        smoothScrollRenderOptions(.{ .offset_y = 0, .before = 2, .after = 2 }),
+    );
+    try std.testing.expectEqual(
+        terminal.RenderState.SmoothScroll{ .offset_y = 4, .before = 2, .after = 2 },
+        smoothScrollRenderOptions(.{ .offset_y = 4 }),
+    );
+}
+
 /// Create a renderer type with the provided graphics API wrapper.
 ///
 /// The graphics API wrapper must provide the interface outlined below.
@@ -1304,17 +1332,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Begin the update of our terminal state. Work that
                 // doesn't require terminal access (e.g. style
                 // denormalization) is deferred to the endUpdate call
-                // outside of this critical section, keeping our lock
-                // hold time as short as possible.
+                // outside of this critical section. Guard rows are only
+                // requested while a visual offset is active so that zero
+                // offset uses the traditional row-aligned path.
                 try self.terminal_state.beginUpdateWithOptions(
                     self.alloc,
                     state.terminal,
                     .{
-                        .smooth_scroll = .{
-                            .offset_y = state.smooth_scroll.offset_y,
-                            .before = 2,
-                            .after = 2,
-                        },
+                        .smooth_scroll = smoothScrollRenderOptions(state.smooth_scroll),
                     },
                 );
 
