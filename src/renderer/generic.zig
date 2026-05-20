@@ -47,12 +47,13 @@ const log = std.log.scoped(.generic_renderer);
 
 fn smoothScrollRenderOptions(
     smooth_scroll: terminal.RenderState.SmoothScroll,
+    include_guards: bool,
 ) terminal.RenderState.SmoothScroll {
     return if (smooth_scroll.offset_y != 0)
         .{
             .offset_y = smooth_scroll.offset_y,
-            .before = 2,
-            .after = 2,
+            .before = if (include_guards) smooth_scroll.before else 0,
+            .after = if (include_guards) smooth_scroll.after else 0,
         }
     else
         .{};
@@ -61,15 +62,19 @@ fn smoothScrollRenderOptions(
 test "smooth scroll render options only guard active visual offsets" {
     try std.testing.expectEqual(
         terminal.RenderState.SmoothScroll{},
-        smoothScrollRenderOptions(.{}),
+        smoothScrollRenderOptions(.{}, true),
     );
     try std.testing.expectEqual(
         terminal.RenderState.SmoothScroll{},
-        smoothScrollRenderOptions(.{ .offset_y = 0, .before = 2, .after = 2 }),
+        smoothScrollRenderOptions(.{ .offset_y = 0, .before = 2, .after = 2 }, true),
     );
     try std.testing.expectEqual(
         terminal.RenderState.SmoothScroll{ .offset_y = 4, .before = 2, .after = 2 },
-        smoothScrollRenderOptions(.{ .offset_y = 4 }),
+        smoothScrollRenderOptions(.{ .offset_y = 4, .before = 2, .after = 2 }, true),
+    );
+    try std.testing.expectEqual(
+        terminal.RenderState.SmoothScroll{ .offset_y = 4 },
+        smoothScrollRenderOptions(.{ .offset_y = 4, .before = 2, .after = 2 }, false),
     );
 }
 
@@ -1424,13 +1429,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // doesn't require terminal access (e.g. style
                 // denormalization) is deferred to the endUpdate call
                 // outside of this critical section. Guard rows are only
-                // requested while a visual offset is active so that zero
-                // offset uses the traditional row-aligned path.
+                // requested for an active offset on primary scrollback;
+                // alternate-screen apps retain their exact grid dimensions.
+                const smooth_scroll_guards = state.terminal.screens.active_key != .alternate;
                 try self.terminal_state.beginUpdateWithOptions(
                     self.alloc,
                     state.terminal,
                     .{
-                        .smooth_scroll = smoothScrollRenderOptions(state.smooth_scroll),
+                        .smooth_scroll = smoothScrollRenderOptions(
+                            state.smooth_scroll,
+                            smooth_scroll_guards,
+                        ),
                     },
                 );
 
