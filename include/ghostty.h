@@ -1143,6 +1143,49 @@ GHOSTTY_API void ghostty_surface_mouse_scroll(ghostty_surface_t,
 GHOSTTY_API bool ghostty_surface_mouse_scroll_is_terminal_input(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_scroll_to_offset(ghostty_surface_t, double);
 GHOSTTY_API void ghostty_surface_set_smooth_scroll_enabled(ghostty_surface_t, bool);
+
+/**
+ * ZENTTY FORK. Raw pty output tee. Delivers the exact bytes the child process
+ * wrote, AFTER they have been applied to the terminal state.
+ *
+ * THREADING: invoked on the surface's dedicated io-reader thread -- never the
+ * main thread -- while libghostty holds its renderer state mutex.
+ *
+ * CONTRACT (each violation is UB or deadlock):
+ *   - `data` is valid ONLY for the duration of the call. Copy it.
+ *   - Do NOT call any ghostty_* function from inside the callback. The mutex is
+ *     a plain non-reentrant mutex; you WILL deadlock.
+ *   - Do NOT block, dispatch_sync, or do I/O. This call is synchronous with the
+ *     pty read loop: time spent here back-pressures the child process and
+ *     stalls the renderer. memcpy and enqueue, nothing else.
+ *   - There is no autorelease pool on this thread.
+ *
+ * Exactly one thread per surface invokes this, so callback order is stream
+ * order and no receiver-side reordering is needed.
+ *
+ * `seq` is the absolute byte offset of data[0] within this surface's output
+ * stream, counted from surface creation. It advances by exactly `len` per call
+ * and KEEPS ADVANCING while no tee is installed, so offsets stay stable across
+ * install/uninstall and a consumer can detect a gap rather than silently
+ * desyncing.
+ */
+typedef void (*ghostty_surface_pty_tee_cb)(void* userdata,
+                                           uint64_t seq,
+                                           const uint8_t* data,
+                                           uintptr_t len);
+
+/**
+ * ZENTTY FORK. Install or remove this surface's raw pty output tee.
+ *
+ * Pass cb = NULL to uninstall; installing replaces any previous tee. Both paths
+ * take the renderer state mutex, which the read thread holds for the whole of
+ * its output-processing body -- so on return from an uninstall no callback is
+ * in flight and none will ever fire again. It is safe to free `userdata`
+ * immediately after. Must NOT be called from inside the callback.
+ */
+GHOSTTY_API void ghostty_surface_set_pty_tee(ghostty_surface_t,
+                                             ghostty_surface_pty_tee_cb /* nullable */,
+                                             void* userdata);
 GHOSTTY_API void ghostty_surface_mouse_pressure(ghostty_surface_t, uint32_t, double);
 GHOSTTY_API void ghostty_surface_ime_point(ghostty_surface_t, double*, double*, double*, double*);
 GHOSTTY_API void ghostty_surface_request_close(ghostty_surface_t);

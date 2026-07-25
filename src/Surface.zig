@@ -3714,6 +3714,18 @@ pub fn mouseScrollIsTerminalInput(self: *const Surface) bool {
         self.io.terminal.modes.get(.mouse_alternate_scroll);
 }
 
+/// ZENTTY FORK: install or remove this surface's raw pty output tee, used by
+/// the mobile companion to mirror the surface to a phone. Pass null to remove.
+///
+/// Takes the renderer state mutex, which the io-reader thread holds for the
+/// whole of `processOutputLocked`. So on return from a removal no callback is
+/// in flight and none will start, and the caller may free its userdata.
+pub fn setPtyTee(self: *Surface, tee: ?termio.Termio.PtyTee) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    self.io.pty_tee = tee;
+}
+
 pub fn setSmoothViewportScrollEnabledCallback(self: *Surface, enabled: bool) !void {
     var should_render = false;
 

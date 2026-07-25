@@ -1908,6 +1908,21 @@ pub const CAPI = struct {
         };
     }
 
+    /// ZENTTY FORK: install or remove this surface's raw pty output tee, used
+    /// by the mobile companion to mirror a surface to a phone. A null callback
+    /// removes it. See ghostty_surface_pty_tee_cb in include/ghostty.h for the
+    /// (strict) threading and lifetime contract the callback must honour.
+    export fn ghostty_surface_set_pty_tee(
+        surface: *Surface,
+        cb: ?*const fn (?*anyopaque, u64, [*]const u8, usize) callconv(.c) void,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.core_surface.setPtyTee(if (cb) |callback| .{
+            .callback = callback,
+            .userdata = userdata,
+        } else null);
+    }
+
     export fn ghostty_surface_mouse_pressure(
         surface: *Surface,
         stage_raw: u32,
