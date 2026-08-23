@@ -3865,8 +3865,8 @@ pub fn setSmoothViewportScrollEnabledCallback(self: *Surface, enabled: bool) !vo
     var should_render = false;
 
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         if (self.smooth_viewport_scroll_enabled != enabled) {
             self.smooth_viewport_scroll_enabled = enabled;
