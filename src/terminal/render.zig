@@ -1563,7 +1563,7 @@ test "smooth scroll update includes extra rows" {
     var t = try Terminal.init(io, alloc, .{
         .cols = 5,
         .rows = 3,
-        .max_scrollback = 1000,
+        .max_scrollback_bytes = 1000,
     });
     defer t.deinit(alloc);
 
