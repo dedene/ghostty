@@ -97,6 +97,23 @@ pub const App = struct {
 
         /// Close the current surface given by this function.
         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
+
+        /// Optional. When set, the embedder drives vsync for every surface
+        /// and the renderer never creates a CVDisplayLink.
+        ///
+        /// CoreVideo stops every running CVDisplayLink from its own display
+        /// reconfiguration callback on the main thread, and that stop can
+        /// wait forever for an IO thread that never acknowledges, hanging
+        /// the whole app. Embedders that have a vsync source not built on
+        /// CVDisplayLink (e.g. CADisplayLink on macOS 14+) can use this to
+        /// avoid that path entirely.
+        ///
+        /// Called on the renderer thread, only when the surface's demand for
+        /// frame ticks changes: true when it wants ticks, false when it no
+        /// longer does. While active, the embedder should call
+        /// ghostty_surface_vsync_tick once per display refresh. This must
+        /// not block.
+        vsync_request: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
     };
 
     /// This is the key event sent for ghostty_surface_key and
@@ -682,6 +699,18 @@ pub const Surface = struct {
         };
 
         func(self.userdata, process_alive);
+    }
+
+    /// True if the embedder drives vsync. See `Options.vsync_request`.
+    pub fn hasExternalVsync(self: *const Surface) bool {
+        return self.app.opts.vsync_request != null;
+    }
+
+    /// Ask the embedder to start or stop sending vsync ticks. Called on
+    /// the renderer thread. See `Options.vsync_request`.
+    pub fn requestVsync(self: *const Surface, active: bool) void {
+        const func = self.app.opts.vsync_request orelse return;
+        func(self.userdata, active);
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
@@ -2435,6 +2464,15 @@ pub const CAPI = struct {
                 .{ .forever = {} },
             );
             surface.renderer_thread.wakeup.notify() catch {};
+        }
+
+        /// One display refresh from an embedder-driven vsync source. See
+        /// `App.Options.vsync_request`. Safe to call from any thread while
+        /// the surface is alive.
+        export fn ghostty_surface_vsync_tick(ptr: *Surface) void {
+            ptr.core_surface.renderer_thread.draw_now.notify() catch |err| {
+                log.err("error notifying draw_now err={}", .{err});
+            };
         }
 
         /// This returns a CTFontRef that should be used for quicklook

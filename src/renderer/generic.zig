@@ -252,6 +252,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// don't support a display link.
         display_link: ?DisplayLink = null,
 
+        /// Set when the apprt drives vsync instead of a CVDisplayLink (see
+        /// `apprt.embedded.App.Options.vsync_request`). When set we never
+        /// create `display_link`, and instead ask the apprt to start or stop
+        /// sending ticks, which arrive as `draw_now` notifications.
+        external_vsync: ?*apprt.Surface = null,
+
+        /// Whether we last asked the apprt for vsync ticks. Only accessed
+        /// on the render thread.
+        external_vsync_active: bool = false,
+
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
 
@@ -748,6 +758,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .alloc = alloc,
                 .config = options.config,
                 .surface_mailbox = options.surface_mailbox,
+                .external_vsync = external_vsync: {
+                    if (comptime DisplayLink == void) break :external_vsync null;
+                    if (comptime !@hasDecl(apprt.Surface, "hasExternalVsync"))
+                        break :external_vsync null;
+                    if (!options.rt_surface.hasExternalVsync())
+                        break :external_vsync null;
+                    break :external_vsync options.rt_surface;
+                },
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
                 .focused = true,
@@ -962,6 +980,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If we don't support a display link we have no work to do.
             if (comptime DisplayLink == void) return;
 
+            // Stop any apprt-driven vsync. Its ticks would target a
+            // render loop that is no longer running.
+            self.setExternalVsync(false);
+
             // Stop our display link. If this fails its okay it just means
             // that we either never started it or the view its attached to
             // is gone which is fine.
@@ -1167,6 +1189,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// That is the only way to trigger a drawFrame.
         pub fn hasVsync(self: *const Self) bool {
             if (comptime DisplayLink == void) return false;
+            if (self.external_vsync != null) return self.external_vsync_active;
             const display_link = self.display_link orelse return false;
             return display_link.isRunning();
         }
@@ -1241,6 +1264,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ) void {
             if (comptime DisplayLink == void) return;
 
+            // An apprt-driven vsync replaces the display link entirely. It
+            // follows the view across displays on its own, so the display
+            // id is not needed.
+            if (self.external_vsync != null) {
+                self.setExternalVsync(self.config.vsync and self.wantsVsync());
+                return;
+            }
+
             const display_link = self.display_link orelse display_link: {
                 if (!self.config.vsync) return;
                 const callback = draw_now orelse return;
@@ -1273,19 +1304,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             }
 
-            const should_run =
-                // Non-visible windows never vsync
-                self.visible and
-                // Only vsync if we have cell changes or animation
-                (self.cells_rebuilt or self.animationWake() != null);
-
-            if (should_run) {
+            if (self.wantsVsync()) {
                 if (!display_link.isRunning()) {
                     display_link.start() catch {};
                 }
             } else {
                 display_link.stop() catch {};
             }
+        }
+
+        /// True if the surface currently needs vsync-paced frames.
+        fn wantsVsync(self: *const Self) bool {
+            // Non-visible windows never vsync
+            if (!self.visible) return false;
+
+            // Only vsync if we have cell changes or animation
+            return self.cells_rebuilt or self.animationWake() != null;
+        }
+
+        /// Tell the apprt whether we want vsync ticks, if it drives vsync.
+        /// Only calls the apprt when the demand changes.
+        ///
+        /// Must be called on the render thread.
+        fn setExternalVsync(self: *Self, active: bool) void {
+            if (comptime DisplayLink == void) return;
+            const rt_surface = self.external_vsync orelse return;
+            if (self.external_vsync_active == active) return;
+            self.external_vsync_active = active;
+            rt_surface.requestVsync(active);
         }
 
         /// Set the new font grid.
