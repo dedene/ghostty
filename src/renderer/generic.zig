@@ -103,6 +103,57 @@ fn linkContainsRenderCell(
     });
 }
 
+test "smooth scroll render rows include overscan and map links to the viewport" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+        .max_scrollback_bytes = 10000,
+    });
+    defer t.deinit(alloc);
+
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("1\r\n2\r\n3\r\n4\r\n5\r\n6");
+
+    // Scroll up so both guard rows exist, as during a smooth scroll.
+    t.scrollViewport(.{ .delta = -2 });
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    state.overscan_request = .{ .above = 2, .below = 2 };
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 7), renderRows(&state));
+    try testing.expectEqual(@as(usize, 7), state.row_data.len);
+    try testing.expectEqual(@as(usize, 2), state.viewportStart());
+
+    // Link sets are in viewport coordinates: viewport row 0 is render row 2.
+    var links: terminal.RenderState.CellSet = .empty;
+    defer links.deinit(alloc);
+    try links.put(alloc, .{ .x = 1, .y = 0 }, {});
+    try links.put(alloc, .{ .x = 1, .y = 2 }, {});
+
+    try testing.expect(!linkContainsRenderCell(&links, &state, 1, 0));
+    try testing.expect(linkContainsRenderCell(&links, &state, 1, 2));
+    try testing.expect(linkContainsRenderCell(&links, &state, 1, 4));
+    try testing.expect(!linkContainsRenderCell(&links, &state, 0, 2));
+
+    // Overscan rows are never link cells, even if a viewport row with the
+    // same index is.
+    try testing.expect(!linkContainsRenderCell(&links, &state, 1, 5));
+    try testing.expect(!linkContainsRenderCell(&links, &state, 1, 6));
+
+    // Without overscan, render rows are viewport rows.
+    state.overscan_request = .{};
+    try state.update(alloc, &t);
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 3), renderRows(&state));
+    try testing.expect(linkContainsRenderCell(&links, &state, 1, 0));
+    try testing.expect(linkContainsRenderCell(&links, &state, 1, 2));
+}
+
 /// Create a renderer type with the provided graphics API wrapper.
 ///
 /// The graphics API wrapper must provide the interface outlined below.
