@@ -78,6 +78,31 @@ test "smooth scroll render options only guard active visual offsets" {
     );
 }
 
+/// The number of rows in the render grid: the viewport plus any overscan
+/// rows requested for smooth scrolling. This matches `row_data.len` after an
+/// update.
+fn renderRows(state: *const terminal.RenderState) terminal.size.CellCountInt {
+    return state.rows +
+        state.overscan_request.above +
+        state.overscan_request.below;
+}
+
+/// Link cell sets use viewport coordinates; render rows include overscan
+/// rows above the viewport, which are never part of a link set.
+fn linkContainsRenderCell(
+    links: *const terminal.RenderState.CellSet,
+    state: *const terminal.RenderState,
+    x: usize,
+    y: usize,
+) bool {
+    const vp_start = state.viewportStart();
+    if (y < vp_start or y >= vp_start + state.rows) return false;
+    return links.contains(.{
+        .x = @intCast(x),
+        .y = @intCast(y - vp_start),
+    });
+}
+
 /// Create a renderer type with the provided graphics API wrapper.
 ///
 /// The graphics API wrapper must provide the interface outlined below.
@@ -291,6 +316,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The render state we update per loop.
         terminal_state: terminal.RenderState = .empty,
+
+        /// The smooth scroll state of the last terminal state update. Its
+        /// guard rows are captured as `terminal_state` overscan rows, so
+        /// render row `y` is viewport row `y - terminal_state.viewportStart()`.
+        smooth_scroll: terminal.RenderState.SmoothScroll = .{},
 
         /// The number of frames since the last terminal state reset.
         /// We reset the terminal state after ~100,000 frames (about 10 to
@@ -1461,16 +1491,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // requested for an active offset on primary scrollback;
                 // alternate-screen apps retain their exact grid dimensions.
                 const smooth_scroll_guards = state.terminal.screens.active_key != .alternate;
-                try self.terminal_state.beginUpdateWithOptions(
-                    self.alloc,
-                    state.terminal,
-                    .{
-                        .smooth_scroll = smoothScrollRenderOptions(
-                            state.smooth_scroll,
-                            smooth_scroll_guards,
-                        ),
-                    },
+                self.smooth_scroll = smoothScrollRenderOptions(
+                    state.smooth_scroll,
+                    smooth_scroll_guards,
                 );
+                self.terminal_state.overscan_request = .{
+                    .above = self.smooth_scroll.before,
+                    .below = self.smooth_scroll.after,
+                };
+                try self.terminal_state.beginUpdate(self.alloc, state.terminal);
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
@@ -1484,12 +1513,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // can be expensive) and also makes it so we don't need another
                 // cross-thread mailbox message within the IO path.
                 var scrollbar = state.terminal.screens.active.pages.scrollbar();
-                if (self.terminal_state.smooth_scroll.active()) scrollbar: {
+                if (self.smooth_scroll.active()) scrollbar: {
                     const cell_height: f64 = @floatFromInt(self.size.cell.height);
                     if (cell_height <= 0) break :scrollbar;
 
                     const offset_fraction =
-                        -@as(f64, self.terminal_state.smooth_scroll.offset_y) / cell_height;
+                        -@as(f64, self.smooth_scroll.offset_y) / cell_height;
                     const int_offset: f64 = @floatFromInt(scrollbar.offset);
                     const max_offset: f64 = if (scrollbar.total > scrollbar.len)
                         @floatFromInt(scrollbar.total - scrollbar.len)
@@ -1588,7 +1617,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .links = links,
                     .mouse = state.mouse,
                     .preedit = preedit,
-                    .smooth_scroll = self.terminal_state.smooth_scroll,
+                    .smooth_scroll = self.smooth_scroll,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
                 };
@@ -2684,13 +2713,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ) Allocator.Error!void {
             const state: *terminal.RenderState = &self.terminal_state;
 
+            // The cell grid holds every row_data entry, including the
+            // overscan rows above and below the viewport. The viewport
+            // starts at render row `vp_start`.
+            const grid_rows = renderRows(state);
+            const vp_start: usize = state.viewportStart();
             const grid_size_diff =
-                self.cells.size.rows != state.rows or
+                self.cells.size.rows != grid_rows or
                 self.cells.size.columns != state.cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
-                new_size.rows = state.rows;
+                new_size.rows = grid_rows;
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
@@ -2738,9 +2772,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // the viewport is shorter than the cell contents buffer, we align
             // the top of the viewport with the top of the contents buffer.
             const row_len: usize = @min(
-                state.rows,
+                grid_rows,
                 self.cells.size.rows,
             );
+
+            // Only these rows hold data from the last update. Overscan
+            // rows that don't exist (top of scrollback, or the viewport
+            // following the active area) are left empty.
+            const row_range = state.rowDataRange();
 
             // Determine our x/y range for preedit. We don't want to render anything
             // here because we will render the preedit separately.
@@ -2754,14 +2793,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If our preedit row isn't dirty then we don't need the
                 // preedit range. This also avoids an issue later where we
                 // unconditionally add preedit cells when this is set.
-                if (!rebuild and !row_dirty[cursor_vp.y]) break :preedit null;
+                const cursor_y = vp_start + cursor_vp.y;
+                if (!rebuild and !row_dirty[cursor_y]) break :preedit null;
 
                 const range = preedit_v.range(
                     cursor_vp.x,
                     state.cols - 1,
                 );
                 break :preedit .{
-                    .y = @intCast(cursor_vp.y),
+                    .y = @intCast(cursor_y),
                     .x = .{ range.start, range.end },
                     .cp_offset = range.cp_offset,
                 };
@@ -2776,6 +2816,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 row_highlights[0..row_len],
             ) |y_usize, row, *cells, *dirty, selection, *highlights| {
                 const y: terminal.size.CellCountInt = @intCast(y_usize);
+
+                if (y_usize < row_range.start or y_usize >= row_range.end) {
+                    // A full rebuild already reset these cells.
+                    if (!rebuild) self.cells.clear(y);
+                    continue;
+                }
 
                 if (!rebuild) {
                     // Only rebuild if we are doing a full rebuild or this row is dirty.
@@ -2821,7 +2867,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const cursor_vp = state.cursor.viewport orelse break :cursor;
                 const cursor_style: terminal.Style = cursor_style: {
                     const cells = state.row_data.items(.cells);
-                    const cell = cells[cursor_vp.y].get(cursor_vp.x);
+                    const cell = cells[vp_start + cursor_vp.y].get(cursor_vp.x);
                     break :cursor_style if (cell.raw.hasStyling())
                         cell.style
                     else
@@ -2876,6 +2922,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 self.addCursor(
                     &state.cursor,
+                    vp_start,
                     style,
                     cursor_color,
                 );
@@ -2892,7 +2939,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
                         },
-                        @intCast(cursor_vp.y),
+                        @intCast(vp_start + cursor_vp.y),
                     };
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
@@ -3000,7 +3047,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .background, .@"extend-always" => {},
 
                 // Apply heuristics for padding extension.
-                .extend => if (y == state.smooth_scroll.before) {
+                .extend => if (y == state.viewportStart()) {
                     self.uniforms.padding_extend.up = !rowNeverExtendBg(
                         row,
                         cells_raw,
@@ -3008,7 +3055,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         &state.colors.palette,
                         state.colors.background,
                     );
-                } else if (y + state.smooth_scroll.after + 1 == self.cells.size.rows) {
+                } else if (y + 1 == state.viewportStart() + state.rows) {
                     self.uniforms.padding_extend.down = !rowNeverExtendBg(
                         row,
                         cells_raw,
@@ -3029,7 +3076,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // visible on this viewport.
                 .cursor_x = cursor_x: {
                     const vp = state.cursor.viewport orelse break :cursor_x null;
-                    if (vp.y != y) break :cursor_x null;
+                    if (state.viewportStart() + vp.y != y) break :cursor_x null;
                     break :cursor_x vp.x;
                 },
             };
@@ -3295,10 +3342,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // an underline, in which case use a double underline to
                 // distinguish them.
                 const underline: terminal.Attribute.Underline = underline: {
-                    if (links.contains(.{
-                        .x = @intCast(x),
-                        .y = @intCast(y),
-                    })) {
+                    if (linkContainsRenderCell(links, state, x, y)) {
                         break :underline if (style.flags.underline == .single)
                             .double
                         else
@@ -3588,6 +3632,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn addCursor(
             self: *Self,
             cursor_state: *const terminal.RenderState.Cursor,
+            vp_start: usize,
             cursor_style: renderer.CursorStyle,
             cursor_color: terminal.color.RGB,
         ) void {
@@ -3663,7 +3708,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, cursor_vp.y },
+                .grid_pos = .{ x, @intCast(vp_start + cursor_vp.y) },
                 .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
