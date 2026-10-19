@@ -1930,6 +1930,49 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result);
     }
 
+    /// Same as ghostty_surface_read_text, but the text keeps its styling
+    /// as VT sequences (SGR colors and attributes) so an embedder can
+    /// replay it later. Colors stay palette indexes, so a replay follows
+    /// the theme in effect at that time. The viewport fields are unset.
+    export fn ghostty_surface_read_text_vt(
+        surface: *Surface,
+        sel: Selection,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+
+        const screen = surface.core_surface.renderer_state.terminal.screens.active;
+        const core_sel = sel.core(screen) orelse return false;
+
+        var aw: std.Io.Writer.Allocating = .init(global.alloc());
+        defer aw.deinit();
+        var formatter: terminal.formatter.ScreenFormatter = .init(screen, .{
+            .emit = .vt,
+            .unwrap = true,
+            .trim = false,
+        });
+        formatter.content = .{ .selection = core_sel };
+        formatter.format(&aw.writer) catch |err| {
+            log.warn("error formatting vt text err={}", .{err});
+            return false;
+        };
+        const text = aw.toOwnedSliceSentinel(0) catch |err| {
+            log.warn("error formatting vt text err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = text.ptr,
+            .text_len = text.len,
+        };
+        return true;
+    }
+
     fn readTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
